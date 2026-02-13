@@ -1,0 +1,511 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Flappy Bird (1 fichier HTML)</title>
+  <style>
+    :root{--bg:#0b1020;--fg:#e6edf7;--muted:rgba(230,237,247,.25);--accent:#5eead4;--danger:#fb7185}
+    html,body{height:100%;margin:0}
+    body{display:grid;place-items:center;background:radial-gradient(1200px 600px at 50% 10%,#111b35,var(--bg));color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;overflow:hidden}
+    .wrap{width:min(920px,96vw);display:grid;gap:10px;justify-items:center}
+    canvas{width:min(420px,96vw);height:auto;border-radius:14px;box-shadow:0 20px 60px rgba(0,0,0,.45);background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.01));outline:1px solid rgba(255,255,255,.08)}
+    .hud{width:min(420px,96vw);display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:14px;opacity:.95;user-select:none;flex-wrap:wrap}
+    kbd{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;padding:2px 6px;border-radius:6px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14)}
+    .pill{padding:4px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.06)}
+    .btn{cursor:pointer;padding:6px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.08);color:var(--fg)}
+    .btn:hover{background:rgba(255,255,255,.12)}
+    .btn:active{transform:translateY(1px)}
+    .accent{border-color:rgba(94,234,212,.5);background:rgba(94,234,212,.10)}
+    .danger{border-color:rgba(251,113,133,.5);background:rgba(251,113,133,.12)}
+    .small{opacity:.8;font-size:12px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hud">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <span class="pill">Flappy Bird</span>
+        <span class="pill">Sauter: <kbd>Espace</kbd> / clic / tap</span>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button id="sound" class="btn accent">Son: ON</button>
+        <button id="reset" class="btn danger">Reset</button>
+      </div>
+    </div>
+
+    <canvas id="c" width="420" height="640" aria-label="Flappy Bird"></canvas>
+
+    <div class="hud small">
+      <span>Astuce: reste au milieu du trou.</span>
+      <span>100% offline · 1 fichier</span>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+
+  const W = canvas.width;
+  const H = canvas.height;
+
+  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+
+  // --- Audio (bips simples) ---
+  let audioCtx = null;
+  let soundOn = true;
+  function beep(freq=440, dur=0.05, type='square', gain=0.03) {
+    if (!soundOn) return;
+    try {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const t0 = audioCtx.currentTime;
+      const osc = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, t0);
+      g.gain.setValueAtTime(gain, t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      osc.connect(g).connect(audioCtx.destination);
+      osc.start(t0);
+      osc.stop(t0 + dur);
+    } catch {}
+  }
+
+  // --- Game constants ---
+  const world = {
+    gravity: 1800,
+    flapVel: -560,
+    scrollSpeed: 220,
+    pipeGap: 160,
+    pipeWidth: 72,
+    pipeEvery: 1.35, // seconds
+    groundH: 90,
+  };
+
+  // --- State ---
+  const state = {
+    started: false,
+    dead: false,
+    score: 0,
+    best: 0,
+    tSincePipe: 0,
+    shake: 0,
+    bird: {
+      x: 120,
+      y: H * 0.42,
+      r: 16,
+      vy: 0,
+      rot: 0,
+    },
+    pipes: [],
+    stars: [],
+  };
+
+  // Load best score
+  try {
+    const b = Number(localStorage.getItem('flappy_best') || 0);
+    state.best = Number.isFinite(b) ? b : 0;
+  } catch {}
+
+  function reset() {
+    state.started = false;
+    state.dead = false;
+    state.score = 0;
+    state.tSincePipe = 0;
+    state.shake = 0;
+    state.bird.x = 120;
+    state.bird.y = H * 0.42;
+    state.bird.vy = 0;
+    state.bird.rot = 0;
+    state.pipes = [];
+
+    // background stars
+    state.stars = Array.from({length: 60}, () => ({
+      x: Math.random()*W,
+      y: Math.random()*(H-world.groundH-40)+20,
+      r: Math.random()*1.6+0.4,
+      a: Math.random()*0.5+0.25,
+      s: Math.random()*30+10,
+    }));
+
+    spawnPipe();
+    spawnPipe();
+    state.pipes[1].x += W*0.65;
+  }
+
+  function spawnPipe() {
+    const marginTop = 60;
+    const marginBottom = 60 + world.groundH;
+    const gap = world.pipeGap;
+    const centerMin = marginTop + gap/2;
+    const centerMax = (H - marginBottom) - gap/2;
+    const center = centerMin + Math.random()*(centerMax-centerMin);
+    state.pipes.push({
+      x: W + 40,
+      center,
+      passed: false,
+    });
+  }
+
+  function flap() {
+    if (state.dead) {
+      reset();
+      return;
+    }
+    if (!state.started) state.started = true;
+    state.bird.vy = world.flapVel;
+    state.shake = 6;
+    beep(520, 0.04, 'square', 0.02);
+  }
+
+  function circleRectCollide(cx, cy, r, rx, ry, rw, rh) {
+    const closestX = clamp(cx, rx, rx + rw);
+    const closestY = clamp(cy, ry, ry + rh);
+    const dx = cx - closestX;
+    const dy = cy - closestY;
+    return (dx*dx + dy*dy) <= r*r;
+  }
+
+  function die() {
+    if (state.dead) return;
+    state.dead = true;
+    state.shake = 14;
+    beep(140, 0.11, 'sawtooth', 0.03);
+    // best score
+    if (state.score > state.best) {
+      state.best = state.score;
+      try { localStorage.setItem('flappy_best', String(state.best)); } catch {}
+    }
+  }
+
+  function update(dt) {
+    // stars
+    for (const st of state.stars) {
+      st.x -= st.s * dt * (state.started && !state.dead ? 1 : 0.25);
+      if (st.x < -5) st.x = W + 5;
+    }
+
+    // idle bob
+    if (!state.started && !state.dead) {
+      state.bird.y = H*0.42 + Math.sin(performance.now()/260)*8;
+      state.bird.rot = Math.sin(performance.now()/240)*0.08;
+      return;
+    }
+
+    // bird physics
+    state.bird.vy += world.gravity * dt;
+    state.bird.y += state.bird.vy * dt;
+    state.bird.rot = clamp(state.bird.vy / 900, -0.55, 1.1);
+
+    // pipes movement
+    const speed = world.scrollSpeed * (state.dead ? 0.35 : 1);
+    for (const p of state.pipes) {
+      p.x -= speed * dt;
+    }
+
+    // spawn pipes
+    if (!state.dead) {
+      state.tSincePipe += dt;
+      if (state.tSincePipe >= world.pipeEvery) {
+        state.tSincePipe = 0;
+        spawnPipe();
+      }
+    }
+
+    // remove old pipes
+    state.pipes = state.pipes.filter(p => p.x > -world.pipeWidth - 40);
+
+    // collisions & scoring
+    const b = state.bird;
+    const groundY = H - world.groundH;
+
+    // ground / ceiling
+    if (b.y - b.r < 0) {
+      b.y = b.r;
+      b.vy = 0;
+    }
+    if (b.y + b.r > groundY) {
+      b.y = groundY - b.r;
+      die();
+    }
+
+    for (const p of state.pipes) {
+      const x = p.x;
+      const topH = p.center - world.pipeGap/2;
+      const botY = p.center + world.pipeGap/2;
+      const w = world.pipeWidth;
+
+      // collision with top pipe
+      if (circleRectCollide(b.x, b.y, b.r, x, 0, w, topH)) {
+        die();
+      }
+      // collision with bottom pipe
+      if (circleRectCollide(b.x, b.y, b.r, x, botY, w, groundY - botY)) {
+        die();
+      }
+
+      // score when passing
+      const pipeMid = x + w/2;
+      if (!p.passed && pipeMid < b.x) {
+        p.passed = true;
+        state.score++;
+        beep(760, 0.035, 'sine', 0.02);
+      }
+    }
+
+    // shake decay
+    state.shake = Math.max(0, state.shake - 40*dt);
+  }
+
+  function draw() {
+    // background
+    ctx.clearRect(0,0,W,H);
+
+    // sky gradient
+    const sky = ctx.createLinearGradient(0,0,0,H);
+    sky.addColorStop(0,'rgba(94,234,212,0.10)');
+    sky.addColorStop(0.5,'rgba(230,237,247,0.06)');
+    sky.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle = sky;
+    ctx.fillRect(0,0,W,H);
+
+    // stars
+    ctx.save();
+    for (const st of state.stars) {
+      ctx.globalAlpha = st.a;
+      ctx.fillStyle = '#e6edf7';
+      ctx.beginPath();
+      ctx.arc(st.x, st.y, st.r, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    const groundY = H - world.groundH;
+
+    // camera shake
+    let ox = 0, oy = 0;
+    if (state.shake > 0) {
+      const s = state.shake;
+      ox = (Math.random()*2-1)*s;
+      oy = (Math.random()*2-1)*s;
+    }
+
+    ctx.save();
+    ctx.translate(ox, oy);
+
+    // pipes
+    for (const p of state.pipes) {
+      const x = p.x;
+      const topH = p.center - world.pipeGap/2;
+      const botY = p.center + world.pipeGap/2;
+
+      drawPipe(x, 0, world.pipeWidth, topH, true);
+      drawPipe(x, botY, world.pipeWidth, groundY - botY, false);
+    }
+
+    // ground
+    drawGround(0, groundY, W, world.groundH);
+
+    // bird
+    drawBird(state.bird);
+
+    ctx.restore();
+
+    // score
+    ctx.save();
+    ctx.fillStyle = 'rgba(230,237,247,.95)';
+    ctx.font = '800 52px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.shadowColor = 'rgba(0,0,0,.35)';
+    ctx.shadowBlur = 10;
+    ctx.fillText(String(state.score), W/2, 18);
+
+    ctx.shadowBlur = 0;
+    ctx.font = '600 14px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.fillStyle = 'rgba(230,237,247,.65)';
+    ctx.fillText(`Best: ${state.best}`, W/2, 78);
+    ctx.restore();
+
+    // overlay
+    if (!state.started && !state.dead) {
+      overlay('Clique / Espace pour commencer', 'Évite les tuyaux');
+    }
+    if (state.dead) {
+      overlay('Perdu !', 'Espace / clic pour rejouer');
+    }
+  }
+
+  function overlay(title, subtitle) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,.35)';
+    ctx.fillRect(0,0,W,H);
+    ctx.fillStyle = 'rgba(230,237,247,.96)';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = '800 28px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.fillText(title, W/2, H*0.42);
+    ctx.font = '500 14px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+    ctx.fillStyle = 'rgba(230,237,247,.78)';
+    ctx.fillText(subtitle, W/2, H*0.42 + 34);
+
+    ctx.font = '500 12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+    ctx.fillStyle = 'rgba(230,237,247,.55)';
+    ctx.fillText('Reset = bouton, ou recharge la page', W/2, H*0.42 + 60);
+    ctx.restore();
+  }
+
+  function drawPipe(x, y, w, h, isTop) {
+    if (h <= 0) return;
+    ctx.save();
+    // body
+    const grad = ctx.createLinearGradient(x,0,x+w,0);
+    grad.addColorStop(0,'rgba(94,234,212,.30)');
+    grad.addColorStop(0.45,'rgba(94,234,212,.55)');
+    grad.addColorStop(1,'rgba(94,234,212,.25)');
+
+    ctx.fillStyle = grad;
+    roundRect(x, y, w, h, 12);
+    ctx.fill();
+
+    // rim
+    const rimH = 18;
+    const ry = isTop ? (y + h - rimH) : y;
+    ctx.fillStyle = 'rgba(94,234,212,.78)';
+    roundRect(x-6, ry, w+12, rimH, 10);
+    ctx.fill();
+
+    // highlight
+    ctx.fillStyle = 'rgba(255,255,255,.10)';
+    roundRect(x+10, y+10, 10, Math.max(0,h-20), 6);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  function drawGround(x,y,w,h) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(230,237,247,.08)';
+    roundRect(x, y, w, h, 14);
+    ctx.fill();
+
+    // stripes
+    ctx.globalAlpha = 0.35;
+    ctx.fillStyle = 'rgba(251,113,133,.35)';
+    const t = performance.now()/1000;
+    for (let i=0;i<10;i++) {
+      const sx = ((i*90 - (t*world.scrollSpeed)%90) % (w+90)) - 20;
+      ctx.fillRect(sx, y+12, 40, 6);
+    }
+
+    ctx.restore();
+  }
+
+  function drawBird(b) {
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    ctx.rotate(b.rot);
+
+    // shadow
+    ctx.fillStyle = 'rgba(0,0,0,.25)';
+    ctx.beginPath();
+    ctx.ellipse(4, 10, b.r*1.1, b.r*0.85, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // body
+    const grad = ctx.createRadialGradient(-6,-6,4, 0,0, b.r*1.6);
+    grad.addColorStop(0,'rgba(251,113,133,.95)');
+    grad.addColorStop(1,'rgba(251,113,133,.55)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(0, 0, b.r, 0, Math.PI*2);
+    ctx.fill();
+
+    // wing
+    ctx.fillStyle = 'rgba(230,237,247,.30)';
+    ctx.beginPath();
+    ctx.ellipse(-6, 2, 10, 6, -0.4, 0, Math.PI*2);
+    ctx.fill();
+
+    // eye
+    ctx.fillStyle = 'rgba(230,237,247,.95)';
+    ctx.beginPath();
+    ctx.arc(6, -5, 6, 0, Math.PI*2);
+    ctx.fill();
+    ctx.fillStyle = '#0b1020';
+    ctx.beginPath();
+    ctx.arc(8, -5, 2.4, 0, Math.PI*2);
+    ctx.fill();
+
+    // beak
+    ctx.fillStyle = 'rgba(94,234,212,.95)';
+    ctx.beginPath();
+    ctx.moveTo(10, 4);
+    ctx.lineTo(24, 1);
+    ctx.lineTo(10, -2);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  function roundRect(x,y,w,h,r) {
+    const rr = Math.min(r, w/2, h/2);
+    ctx.beginPath();
+    ctx.moveTo(x+rr, y);
+    ctx.arcTo(x+w, y, x+w, y+h, rr);
+    ctx.arcTo(x+w, y+h, x, y+h, rr);
+    ctx.arcTo(x, y+h, x, y, rr);
+    ctx.arcTo(x, y, x+w, y, rr);
+    ctx.closePath();
+  }
+
+  // --- Input ---
+  function userGesture() {
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(()=>{});
+  }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space') {
+      e.preventDefault();
+      userGesture();
+      flap();
+    }
+    if (e.code === 'KeyR') {
+      reset();
+      beep(660, 0.05, 'sine', 0.02);
+    }
+  });
+
+  canvas.addEventListener('pointerdown', () => { userGesture(); flap(); });
+
+  document.getElementById('reset').addEventListener('click', () => reset());
+  document.getElementById('sound').addEventListener('click', async () => {
+    soundOn = !soundOn;
+    document.getElementById('sound').textContent = `Son: ${soundOn ? 'ON' : 'OFF'}`;
+    if (soundOn) {
+      try {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+      } catch {}
+      beep(740, 0.04, 'sine', 0.02);
+    }
+  });
+
+  // --- Loop ---
+  let last = performance.now();
+  function loop(now) {
+    const dt = clamp((now-last)/1000, 0, 0.033);
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  reset();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
